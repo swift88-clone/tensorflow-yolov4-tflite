@@ -30,60 +30,77 @@ def main(_argv):
     session = InteractiveSession(config=config)
     STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
     input_size = FLAGS.size
-    image_path = FLAGS.image
+    #image_path = FLAGS.image
+    images = ['/content/dataframe/frame'+ str(cf) + '.jpg' for cf in range(0, 2010,10)]
+    bb = np.empty([len(images), 1, 50, 4])
+    cc = np.empty([len(images), 1, 50])
+    ii = 0
+    for image_path in images:
+      original_image = cv2.imread(str(image_path))
+      original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
 
-    original_image = cv2.imread(image_path)
-    original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+      # image_data = utils.image_preprocess(np.copy(original_image), [input_size, input_size])
+      image_data = cv2.resize(original_image, (input_size, input_size))
+      image_data = image_data / 255.
+      # image_data = image_data[np.newaxis, ...].astype(np.float32)
 
-    # image_data = utils.image_preprocess(np.copy(original_image), [input_size, input_size])
-    image_data = cv2.resize(original_image, (input_size, input_size))
-    image_data = image_data / 255.
-    # image_data = image_data[np.newaxis, ...].astype(np.float32)
+      images_data = []
+      for i in range(1):
+          images_data.append(image_data)
+      images_data = np.asarray(images_data).astype(np.float32)
 
-    images_data = []
-    for i in range(1):
-        images_data.append(image_data)
-    images_data = np.asarray(images_data).astype(np.float32)
+      if FLAGS.framework == 'tflite':
+          interpreter = tf.lite.Interpreter(model_path=FLAGS.weights)
+          interpreter.allocate_tensors()
+          input_details = interpreter.get_input_details()
+          output_details = interpreter.get_output_details()
+          print(input_details)
+          print(output_details)
+          interpreter.set_tensor(input_details[0]['index'], images_data)
+          interpreter.invoke()
+          pred = [interpreter.get_tensor(output_details[i]['index']) for i in range(len(output_details))]
+          if FLAGS.model == 'yolov3' and FLAGS.tiny == True:
+              boxes, pred_conf = filter_boxes(pred[1], pred[0], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
+          else:
+              boxes, pred_conf = filter_boxes(pred[0], pred[1], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
+      else:
+          saved_model_loaded = tf.saved_model.load(FLAGS.weights, tags=[tag_constants.SERVING])
+          infer = saved_model_loaded.signatures['serving_default']
+          batch_data = tf.constant(images_data)
+          pred_bbox = infer(batch_data)
+          for key, value in pred_bbox.items():
+              boxes = value[:, :, 0:4]
+              pred_conf = value[:, :, 4:]
 
-    if FLAGS.framework == 'tflite':
-        interpreter = tf.lite.Interpreter(model_path=FLAGS.weights)
-        interpreter.allocate_tensors()
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        print(input_details)
-        print(output_details)
-        interpreter.set_tensor(input_details[0]['index'], images_data)
-        interpreter.invoke()
-        pred = [interpreter.get_tensor(output_details[i]['index']) for i in range(len(output_details))]
-        if FLAGS.model == 'yolov3' and FLAGS.tiny == True:
-            boxes, pred_conf = filter_boxes(pred[1], pred[0], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
-        else:
-            boxes, pred_conf = filter_boxes(pred[0], pred[1], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
-    else:
-        saved_model_loaded = tf.saved_model.load(FLAGS.weights, tags=[tag_constants.SERVING])
-        infer = saved_model_loaded.signatures['serving_default']
-        batch_data = tf.constant(images_data)
-        pred_bbox = infer(batch_data)
-        for key, value in pred_bbox.items():
-            boxes = value[:, :, 0:4]
-            pred_conf = value[:, :, 4:]
+      boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
+          boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
+          scores=tf.reshape(
+              pred_conf, (tf.shape(pred_conf)[0], -1, tf.shape(pred_conf)[-1])),
+          max_output_size_per_class=50,
+          max_total_size=50,
+          iou_threshold=FLAGS.iou,
+          score_threshold=FLAGS.score
+      )
+      pred_bbox = [boxes.numpy(), scores.numpy(), classes.numpy(), valid_detections.numpy()]
+      """out_boxes, out_scores, out_classes, num_boxes = pred_bbox
+      image_h, image_w, _ = original_image.shape
+      for i in range(num_boxes[0]):
+          if int(out_classes[0][i]) < 0 : continue
+          coor = out_boxes[0][i]
+          coor[0] = int(coor[0] * image_h)
+          coor[2] = int(coor[2] * image_h)
+          coor[1] = int(coor[1] * image_w)
+          coor[3] = int(coor[3] * image_w)
 
-    boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
-        boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
-        scores=tf.reshape(
-            pred_conf, (tf.shape(pred_conf)[0], -1, tf.shape(pred_conf)[-1])),
-        max_output_size_per_class=50,
-        max_total_size=50,
-        iou_threshold=FLAGS.iou,
-        score_threshold=FLAGS.score
-    )
-    pred_bbox = [boxes.numpy(), scores.numpy(), classes.numpy(), valid_detections.numpy()]
-    image = utils.draw_bbox(original_image, pred_bbox)
-    # image = utils.draw_bbox(image_data*255, pred_bbox)
-    image = Image.fromarray(image.astype(np.uint8))
-    image.show()
-    image = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
-    cv2.imwrite(FLAGS.output, image)
+          fontScale = 0.5
+          score = out_scores[0][i]
+          class_ind = int(out_classes[0][i])
+          c1, c2 = (coor[1], coor[0]), (coor[3], coor[2])"""
+      bb[ii]= boxes
+      cc[ii]= classes
+      ii = ii+1
+    np.save('/content/framebb.npy', bb)
+    np.save('/content/framecc.npy',cc)
 
 if __name__ == '__main__':
     try:
